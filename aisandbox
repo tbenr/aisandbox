@@ -1,0 +1,1326 @@
+#!/bin/zsh
+#
+# aisandbox — start, harden and tunnel an OrbStack VM used as a sandbox for
+# AI coding agents.
+#
+# Runs on the Mac. Everything that needs root inside the VM is done from here
+# through `orb -u root`, so the agent user in the VM needs (and has) no sudo.
+# See README.md next to this script.
+
+emulate -R zsh
+setopt no_unset pipe_fail
+
+MACHINE=${AISANDBOX_MACHINE:-AIsandbox}
+STATE=${AISANDBOX_HOME:-$HOME/.aisandbox}
+RUN=$STATE/run
+CONF=$STATE/tunnels.conf
+SSH_CFG=$STATE/ssh_config
+TUNNEL_KEY=$STATE/tunnel_ed25519
+KNOWN=$STATE/known_hosts
+ORB_SSH_CFG=$HOME/.orbstack/ssh/config
+SSHD_PORT=2222          # tunnel sshd inside the VM (loopback only)
+PORT_BASE=2200          # first VM port handed out to tunnels
+VM_HOST=aisb-vm         # Host alias in $SSH_CFG
+REBOOT_FLAG=/run/aisandbox-reboot-needed   # set by vm/provision.sh, see cmd_up
+SRC=${0:A:h}            # directory of this script, symlinks resolved
+
+# --- output ------------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+	B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' D=$'\e[2m' N=$'\e[0m'
+else
+	B= G= R= Y= D= N=
+fi
+info() { print -r -- "${B}==>${N} $*" }
+note() { print -r -- "    $*" }
+warn() { print -ru2 -- "${Y}warning:${N} $*" }
+err()  { print -ru2 -- "${R}error:${N} $*" }
+die()  { err "$*"; exit 1 }
+
+typeset -i FAILS=0
+pass() { print -r -- "  ${G}ok${N}    $*" }
+fail() { print -r -- "  ${R}FAIL${N}  $*"; (( FAILS += 1 )) }
+skip() { print -r -- "  ${Y}skip${N}  $*" }
+
+confirm() {
+	[[ -t 0 ]] || return 1
+	local reply
+	read -r "reply?$1 [y/N] "
+	[[ $reply == [yY]* ]]
+}
+
+# --- OrbStack helpers ----------------------------------------------------------
+
+# Commands inside the VM. stdin is closed unless the *_in variant is used, so
+# these are safe inside read loops.
+vm()        { orb -m $MACHINE "$@" </dev/null }
+vmroot()    { orb -m $MACHINE -u root "$@" </dev/null }
+vm_in()     { orb -m $MACHINE "$@" }
+vmroot_in() { orb -m $MACHINE -u root "$@" }
+
+# Prints the value of OrbStack setting $1. FAILS if the configuration could not
+# be read. That is a different answer from "the setting is empty", and a
+# caller that concludes something from an empty value (no shared folders, an
+# entry is gone) has to check which of the two it got.
+cfg_get() {
+	local all
+	all=$(orb config show 2>/dev/null) || return 1
+	[[ -n $all ]] || return 1
+	print -r -- $all | awk -F': ' -v k="$1" '$1 == k { print $2; exit }'
+	return 0
+}
+
+require_orb() {
+	command -v orb >/dev/null || die "the 'orb' command was not found; is OrbStack installed?"
+	orb list -q 2>/dev/null | grep -qx -- $MACHINE || die "no OrbStack machine named '$MACHINE' (see 'orb list')"
+}
+
+vm_running() { orb list -r -q 2>/dev/null | grep -qx -- $MACHINE }
+vm_state()   { orb list 2>/dev/null | awk -v m=$MACHINE '$1 == m { print $2; exit }' }
+
+need_running() { vm_running || die "$MACHINE is not running; start it with: aisandbox up" }
+
+# Starts the VM if needed and waits until it accepts commands. Returns non-zero
+# instead of exiting: at that point the VM may be running without having been
+# provisioned, and the caller has to stop it (see fail_closed).
+ensure_running() {
+	if ! vm_running; then
+		info "Starting $MACHINE"
+		orb start $MACHINE >/dev/null 2>&1 || { err "could not start $MACHINE"; return 1 }
+	fi
+	local i
+	for i in {1..40}; do
+		vm true 2>/dev/null && return 0
+		sleep 0.5
+	done
+	err "$MACHINE is running but does not accept commands"
+	return 1
+}
+
+agent_user() {
+	local u=$(cfg_get machine.$MACHINE.username)
+	print -r -- ${u:-$USER}
+}
+
+ensure_state() {
+	mkdir -p $RUN 2>/dev/null && chmod 700 $STATE $RUN || { err "cannot create or secure $STATE"; return 1 }
+	[[ -f $CONF ]] || : > $CONF
+}
+need_state() { ensure_state || exit 1 }
+
+# --- tunnel registry -------------------------------------------------------------
+# One line per tunnel in $CONF:
+#   name|kind|target|vmport|user|rport|auto|identity|env|note
+#   kind=ssh     target is an ssh destination as you would type it on the Mac
+#   kind=direct  target is host:port, reached directly from the Mac
+#   identity     optional key file for the Mac's own login (ssh -i)
+#   env          optional NAME=VALUE,... set for that login (e.g. AWS_PROFILE,
+#                read by a ProxyCommand in your ssh config)
+#   note         optional text for the agents: what this machine is
+# Of all this, the VM is only ever told: name, vmport, user and note. Where a
+# tunnel really leads (target) and how the Mac logs in stay on the Mac.
+
+typeset -a T_NAMES
+typeset -A T_KIND T_TARGET T_PORT T_USER T_RPORT T_AUTO T_IDENT T_ENV T_NOTE
+
+load_tunnels() {
+	T_NAMES=() T_KIND=() T_TARGET=() T_PORT=() T_USER=() T_RPORT=() T_AUTO=() T_IDENT=() T_ENV=() T_NOTE=()
+	[[ -f $CONF ]] || return 0
+	local name kind target port user rport auto ident envs tnote
+	while IFS='|' read -r name kind target port user rport auto ident envs tnote; do
+		[[ -z $name || $name == \#* ]] && continue
+		T_NAMES+=($name)
+		T_KIND[$name]=$kind T_TARGET[$name]=$target T_PORT[$name]=$port
+		T_USER[$name]=$user T_RPORT[$name]=$rport T_AUTO[$name]=$auto
+		T_IDENT[$name]=$ident T_ENV[$name]=$envs T_NOTE[$name]=$tnote
+	done < $CONF
+}
+
+save_tunnels() {
+	local n tmp=$CONF.tmp
+	{
+		print -r -- "# aisandbox tunnels: name|kind|target|vmport|user|rport|auto|identity|env|note"
+		for n in $T_NAMES; do
+			print -r -- "$n|$T_KIND[$n]|$T_TARGET[$n]|$T_PORT[$n]|$T_USER[$n]|$T_RPORT[$n]|$T_AUTO[$n]|${T_IDENT[$n]:-}|${T_ENV[$n]:-}|${T_NOTE[$n]:-}"
+		done
+	} > $tmp && mv -f $tmp $CONF
+}
+
+need_tunnel() {
+	(( ${T_NAMES[(Ie)$1]} )) || die "no tunnel named '$1' (see: aisandbox tunnel ls)"
+}
+
+# A note ends up in a '|'-separated file and in a Markdown table.
+check_note() {
+	local text=${1:-}
+	[[ $text != *'|'* && $text != *$'\n'* ]] || die "a note cannot contain '|' or a line break"
+	(( ${#text} <= 200 )) || die "a note can be at most 200 characters"
+}
+
+# --- shared folders ------------------------------------------------------------------
+# OrbStack mounts a shared folder in the VM at /mnt/mac/<path on the Mac>, or
+# at DEST for an entry written SOURCE:DEST. This tool wants SOURCE:SOURCE: the
+# folder at the same path it has on the Mac. Git records the physical path it
+# works in, so only then do git worktrees work across the Mac and the VM, in
+# both directions.
+
+# The share entries as OrbStack has them (SOURCE or SOURCE:DEST), one per
+# line. Fails if the configuration could not be read.
+share_entries() {
+	local all
+	local -a entries
+	all=$(cfg_get machine.$MACHINE.mounts) || return 1
+	entries=(${(s:,:)all})
+	(( $#entries )) && print -rl -- $entries
+	return 0
+}
+
+# Every shared folder, one per line: "Mac path<TAB>path in the VM". Fails if
+# the configuration could not be read.
+share_list() {
+	local m src dest all
+	all=$(share_entries) || return 1
+	for m in ${(f)all}; do
+		src=${m%%:*}
+		if [[ $m == *:* ]]; then dest=${m#*:}; else dest=/mnt/mac$src; fi
+		print -r -- "$src"$'\t'"$dest"
+	done
+}
+
+# Asks the VM, for every shared folder: is OrbStack's mount of exactly that
+# Mac folder at its path right now? Lines of "ok<TAB>Mac path<TAB>path in the
+# VM", or "failed" in place of ok. The mount's source names the Mac folder,
+# which is what makes this more than "something is mounted there": an empty
+# directory at the path, or a mount of something else, is not it.
+# Fails if the VM could not be asked. An empty or short answer is not "nothing
+# wrong" either: callers compare the number of lines with share_list.
+shares_status() {
+	local line list
+	local -a args
+	list=$(share_list) || return 1
+	for line in ${(f)list}; do args+=("${line%%$'\t'*}" "${line#*$'\t'}"); done
+	(( $#args )) || return 0
+	vmroot sh -c '# aisandbox-shares-status
+		while [ $# -ge 2 ]; do
+			src=$1; at=$2; shift 2
+			state=failed
+			if [ "$(findmnt -n -o FSTYPE -M "$at" 2>/dev/null | tail -1)" = virtiofs ]; then
+				case "$(findmnt -n -o SOURCE -M "$at" 2>/dev/null | tail -1)" in *"[$src]") state=ok ;; esac
+			fi
+			printf "%s\t%s\t%s\n" "$state" "$src" "$at"
+		done' sh $args 2>/dev/null | tr -d '\r'
+}
+
+# Asks the VM whether a shared folder may be mounted at each given path (see
+# vm/sharecheck.sh for why that is a question). One line per path, in the
+# order given: "safe<TAB>path" or "unsafe<TAB>path<TAB>why".
+share_check() {
+	vmroot_in env AGENT_USER=$(agent_user) bash -s -- "$@" < $SRC/vm/sharecheck.sh 2>/dev/null | tr -d '\r'
+}
+
+# Is $2 one of the share entries listed (one per line) in $1? ($1 is quoted
+# by callers: an empty list would otherwise vanish as an argument.)
+has_entry() {
+	local -a lines
+	lines=(${(f)1})
+	(( ${lines[(Ie)$2]} ))
+}
+
+# Rewrites one share entry, in an order in which no failure can cost the
+# folder its share: add the new entry, SEE that it is there, and only then
+# remove the old one. If the add fails, the original is left alone. If the
+# removal fails, the folder is registered twice, which is reported as a
+# failure too, because removing "the" share later must remove all of it.
+# Every step is judged by reading the configuration back, and a configuration
+# that cannot be read proves nothing.
+share_replace() {   # <old entry> <new entry>
+	local have
+	orb config add machine.$MACHINE.mounts $2 >/dev/null 2>&1
+	have=$(share_entries) || return 1
+	has_entry "$have" $2 || return 1
+	orb config remove machine.$MACHINE.mounts $1 >/dev/null 2>&1
+	have=$(share_entries) || return 1
+	has_entry "$have" $2 && ! has_entry "$have" $1
+}
+
+# Asks the VM about every shared folder and checks that the answer covers
+# them all. Leaves the answer in SHARE_LINES (see shares_status) and the
+# number of configured shares in SHARES_WANT. Returns 1 if the VM could not be
+# asked, 2 if it answered for fewer or more folders than are shared, 3 if
+# OrbStack's configuration could not be read, so that it is not even known
+# which folders are shared.
+typeset -a SHARE_LINES
+typeset -i SHARES_WANT=0
+shares_check() {
+	local out
+	local -a want
+	# An array on purpose: counted as a string, a single line would give its
+	# length in characters.
+	SHARE_LINES=()
+	SHARES_WANT=0
+	out=$(share_list) || return 3
+	want=(${(f)out})
+	SHARES_WANT=$#want
+	out=$(shares_status) || return 1
+	SHARE_LINES=(${(f)out})
+	(( $#SHARE_LINES == SHARES_WANT )) || return 2
+	return 0
+}
+
+# Moves every share that is still at /mnt/mac/... to its Mac path, where that
+# is safe. Needs the VM running: the check looks at its file system. Sets
+# SHARES_MOVED when an entry changed; OrbStack applies it at the next VM start.
+SHARES_MOVED=0
+move_shares_to_mac_paths() {
+	local m out why
+	local -a plain answers
+	local -i i failed=0
+	out=$(share_entries) || { warn "could not read OrbStack's list of shared folders"; return 1 }
+	for m in ${(f)out}; do [[ $m == *:* ]] || plain+=($m); done
+	(( $#plain )) || return 0
+	out=$(share_check $plain) || { warn "could not check whether the shared folders can be mounted at their Mac paths"; return 1 }
+	answers=(${(f)out})
+	(( $#answers == $#plain )) || { warn "could not check whether the shared folders can be mounted at their Mac paths"; return 1 }
+	for (( i = 1; i <= $#plain; i++ )); do
+		m=$plain[i]
+		if [[ $answers[i] == safe$'\t'* ]]; then
+			if share_replace $m $m:$m; then
+				note "shared folder $m: will be mounted at its Mac path in the VM"
+				SHARES_MOVED=1
+			else
+				warn "could not replace the OrbStack entry of shared folder $m. It is still shared as it was, possibly twice ('aisandbox mount ls' shows it). The next 'aisandbox up' tries again"
+				failed=1
+			fi
+		else
+			why=${answers[i]##*$'\t'}
+			note "shared folder $m stays at /mnt/mac$m in the VM: $why"
+		fi
+	done
+	return $failed
+}
+
+# Prints template file $1 filled in from the TPL array:
+#   {{NAME}}            is replaced by TPL[NAME]; alone on a line, the value is
+#                       printed as it is and may span several lines
+#   <!-- if NAME -->    the lines up to "<!-- end -->" are kept only if
+#   <!-- else -->       TPL[NAME] is not empty; "else" gives the alternative
+#   <!--# ...           such a line is a comment in the template and is dropped
+typeset -A TPL
+render_template() {
+	local line name keep=1
+	while IFS= read -r line; do
+		case $line in
+			'<!--#'*) continue ;;
+			'<!-- if '*' -->') name=${${line#'<!-- if '}%' -->'}; [[ -n ${TPL[$name]:-} ]] && keep=1 || keep=0; continue ;;
+			'<!-- else -->') (( keep = !keep )); continue ;;
+			'<!-- end -->') keep=1; continue ;;
+		esac
+		(( keep )) || continue
+		if [[ $line =~ '^\{\{[A-Z_]+\}\}$' ]]; then
+			name=${line[3,-3]}          # without the braces
+			print -r -- ${TPL[$name]:-}
+		else
+			for name in ${(k)TPL}; do line=${line//"{{$name}}"/$TPL[$name]}; done
+			print -r -- $line
+		fi
+	done < $1
+}
+
+# The instructions an agent gets at the start of every session in the VM. The
+# text is in vm/agent-instructions.md; this fills in what depends on the setup.
+agent_instructions() {
+	local n line st src at
+	local -a rows at_mac elsewhere
+	[[ -r $SRC/vm/agent-instructions.md ]] || return 1
+	for n in $T_NAMES; do
+		rows+=("| \`$n\` | $T_USER[$n] | ${T_NOTE[$n]:-(no description given)} |")
+	done
+	# The shared folders, as the VM really has them (shares_status asks it).
+	# One that is not mounted is not mentioned at all: sending an agent to an
+	# empty directory would be worse than saying nothing.
+	for line in ${(f)"$(shares_status)"}; do
+		st=${line%%$'\t'*} src=${${line#*$'\t'}%%$'\t'*} at=${line##*$'\t'}
+		[[ $st == ok ]] || continue
+		if [[ $at == $src ]]; then at_mac+=("- \`$src\`"); else elsewhere+=("- \`$at\` (on the Mac: \`$src\`)"); fi
+	done
+	TPL=(
+		MACHINE            "$MACHINE"
+		TUNNELS            "${(F)rows}"
+		SHARES             "${(F)at_mac}${(F)elsewhere}"
+		SHARES_AT_MAC_PATH "${(F)at_mac}"
+		SHARES_ELSEWHERE   "${(F)elsewhere}"
+	)
+	render_template $SRC/vm/agent-instructions.md
+}
+
+# Brings the VM's view of the tunnels in line with the registry:
+#   - the ssh client config, so an agent only ever types `ssh <name>`
+#   - the data file read by the `sandbox-tunnels` command
+#   - the instruction file Claude Code loads at the start of every session
+#     (/etc/claude-code/CLAUDE.md, its location for machine-wide instructions)
+# All three are root-owned in the VM; agents can read them, not change them.
+# Returns non-zero if any of them could not be written, and prints nothing:
+# what a failure means differs per caller (a note not published, a new tunnel
+# not usable, a removed one still listed), so each one says it in its own words.
+sync_vm_tunnels() {
+	local n ok=1
+	{
+		print -r -- "# Managed by aisandbox, written from the Mac. One Host per tunnel."
+		print -r -- "# Each one is a port on this VM's loopback that leads to a remote machine."
+		for n in $T_NAMES; do
+			print -r -- ""
+			print -r -- "Host $n"
+			print -r -- "    HostName 127.0.0.1"
+			print -r -- "    Port $T_PORT[$n]"
+			print -r -- "    User $T_USER[$n]"
+			print -r -- "    HostKeyAlias aisandbox-$n"
+			print -r -- "    IdentityFile ~/.ssh/id_ed25519"
+			print -r -- "    IdentitiesOnly yes"
+			print -r -- "    StrictHostKeyChecking accept-new"
+		done
+	} | vmroot_in sh -c 'cat > /etc/ssh/ssh_config.d/aisandbox.conf && chmod 0644 /etc/ssh/ssh_config.d/aisandbox.conf' || ok=0
+
+	for n in $T_NAMES; do
+		print -r -- "$n|$T_PORT[$n]|$T_USER[$n]|${T_NOTE[$n]:-}"
+	done | vmroot_in sh -c 'install -d -m 0755 /etc/aisandbox && cat > /etc/aisandbox/tunnels && chmod 0644 /etc/aisandbox/tunnels' || ok=0
+
+	# Generated first, written second: a failure to generate it must not leave
+	# the agents with an empty instruction file.
+	local text
+	if text=$(agent_instructions) && [[ -n $text ]]; then
+		print -r -- $text | vmroot_in sh -c 'install -d -m 0755 /etc/claude-code && cat > /etc/claude-code/CLAUDE.md && chmod 0644 /etc/claude-code/CLAUDE.md' || ok=0
+	else
+		ok=0
+	fi
+
+	(( ok ))
+}
+
+# --- provisioning ----------------------------------------------------------------
+
+write_mac_ssh_config() {
+	cat > $SSH_CFG <<EOF
+# Managed by aisandbox. How the Mac reaches the tunnel sshd inside the VM:
+# through OrbStack's own SSH channel, never over the network.
+Host $VM_HOST
+    HostName 127.0.0.1
+    Port $SSHD_PORT
+    User aisb-tunnel
+    HostKeyAlias aisandbox-vm
+    IdentityFile "$TUNNEL_KEY"
+    IdentitiesOnly yes
+    IdentityAgent none
+    UserKnownHostsFile "$KNOWN"
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    ForwardAgent no
+    ProxyCommand ssh -F "$ORB_SSH_CFG" -W 127.0.0.1:$SSHD_PORT $MACHINE@orb
+EOF
+	chmod 600 $SSH_CFG
+}
+
+# Applies the whole in-VM configuration. Idempotent; run on every `up`.
+# Returns non-zero on any failure and never exits: the caller decides what
+# happens to a VM that could not be hardened (see fail_closed).
+provision() {
+	[[ -r $SRC/vm/provision.sh && -r $SRC/vm/nftables.conf && -r $SRC/vm/sharecheck.sh ]] \
+		|| { err "missing provision.sh, nftables.conf or sharecheck.sh in $SRC/vm"; return 1 }
+	if [[ ! -f $TUNNEL_KEY ]]; then
+		ssh-keygen -q -t ed25519 -N '' -C "aisandbox-tunnel" -f $TUNNEL_KEY || { err "could not create $TUNNEL_KEY"; return 1 }
+	fi
+	local pub hostkey
+	pub=$(awk '{ print $1, $2 }' $TUNNEL_KEY.pub)
+	[[ -n $pub ]] || { err "cannot read $TUNNEL_KEY.pub"; return 1 }
+
+	vmroot_in sh -c 'install -d -m 0755 /etc/aisandbox && cat > /etc/aisandbox/nftables.conf' < $SRC/vm/nftables.conf \
+		|| { err "could not copy the firewall rules into the VM"; return 1 }
+	# The Mac's git author identity becomes the VM's default, so that commits
+	# an agent makes in a shared repository are attributed to you.
+	local gname gemail
+	gname=$(git config --global --get user.name 2>/dev/null)
+	gemail=$(git config --global --get user.email 2>/dev/null)
+	vmroot_in env AGENT_USER=$(agent_user) TUNNEL_PUBKEY=$pub SSHD_PORT=$SSHD_PORT \
+		NFT_RULES=/etc/aisandbox/nftables.conf \
+		GIT_AUTHOR_NAME_DEFAULT=$gname GIT_AUTHOR_EMAIL_DEFAULT=$gemail \
+		bash -s < $SRC/vm/provision.sh \
+		|| { err "the provisioning script failed inside the VM"; return 1 }
+
+	# Pin the VM sshd's host key, read through the root channel (no trust on first use).
+	hostkey=$(vmroot cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{ print $1, $2 }')
+	[[ -n $hostkey ]] || { err "could not read the VM's ssh host key"; return 1 }
+	print -r -- "aisandbox-vm $hostkey" > $KNOWN
+	write_mac_ssh_config
+	return 0
+}
+
+close_all_tunnels() {
+	local n
+	load_tunnels
+	for n in $T_NAMES; do tunnel_down $n; done
+}
+
+# Stops the VM and checks that it stayed down. OrbStack starts a machine again
+# when anything connects to it over SSH (a tunnel still closing, an editor,
+# Claude desktop), so one `orb stop` is not always enough.
+stop_vm() {
+	local try
+	for try in 1 2 3; do
+		[[ $(vm_state) == stopped ]] && return 0
+		orb stop $MACHINE >/dev/null 2>&1
+		sleep 2
+	done
+	[[ $(vm_state) == stopped ]]
+}
+
+# The VM could not be brought into its hardened state: do not leave it running.
+fail_closed() {
+	err "$1"
+	close_all_tunnels
+	if stop_vm; then
+		print -ru2 -- "       $MACHINE has been stopped so that it does not keep running unhardened."
+	else
+		print -ru2 -- "       ${R}$MACHINE could NOT be stopped and may be running unhardened. Stop it with: orb stop $MACHINE${N}"
+	fi
+	exit 1
+}
+
+# OrbStack-level settings. $1 = fix | report. Sets NEED_RESTART when a setting
+# was changed (they apply the next time the VM starts). In fix mode, returns
+# non-zero if a setting could not be corrected.
+NEED_RESTART=0
+orb_settings() {
+	local mode=$1 key want have spec
+	for spec in \
+		"machine.$MACHINE.isolated=true" \
+		"machine.$MACHINE.isolate_network=true" \
+		"machine.$MACHINE.forward_ssh_agent=false" \
+		"machines.expose_ports_to_lan=false"
+	do
+		key=${spec%%=*} want=${spec#*=}
+		have=$(cfg_get $key)
+		if [[ $have == $want ]]; then
+			[[ $mode == report ]] && pass "OrbStack $key = $want"
+		elif [[ $mode == fix ]]; then
+			orb config set $key $want >/dev/null 2>&1
+			if [[ $(cfg_get $key) != $want ]]; then
+				err "could not set OrbStack option $key to $want (it is ${have:-unset})"
+				return 1
+			fi
+			note "OrbStack: $key ${have:-unset} -> $want"
+			NEED_RESTART=1
+		else
+			fail "OrbStack $key = ${have:-unset} (expected $want; run: aisandbox up)"
+		fi
+	done
+	return 0
+}
+
+# --- tunnels -----------------------------------------------------------------------
+
+ssh_keepalive=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes)
+
+# Starts a long-lived `ssh -f`. The process that stays behind must not keep our
+# stdout/stderr open, or `aisandbox ... | tee log` would never see end-of-file.
+# ssh's own messages go to a log file instead (-E), and so does stderr, which
+# is where a ProxyCommand (e.g. the aws CLI) reports why it failed. Password,
+# passphrase and host-key prompts are unaffected: ssh asks those on the terminal.
+bg_ssh() {
+	local log=$1
+	shift
+	: > $log
+	ssh -E $log "$@" >/dev/null 2>>$log
+}
+ssh_why() { [[ -s $1 ]] && sed 's/^/            /' $1 | tail -5 }
+
+a_alive() { ssh -S $RUN/$1.a -O check -- $T_TARGET[$1] >/dev/null 2>&1 }
+b_alive() { ssh -F $SSH_CFG -S $RUN/$1.b -O check $VM_HOST >/dev/null 2>&1 }
+
+# Reads the first bytes from the tunnel's port inside the VM. An SSH server at
+# the far end answers "SSH-", which proves the whole path without logging in.
+tunnel_probe() {
+	local out
+	out=$(vm timeout 6 bash -c "exec 3<>/dev/tcp/127.0.0.1/$T_PORT[$1] && head -c 4 <&3" 2>/dev/null)
+	[[ $out == SSH- ]]
+}
+
+tunnel_state() {
+	local n=$1
+	if [[ $T_KIND[$n] == ssh ]]; then
+		if b_alive $n && a_alive $n; then print up
+		elif b_alive $n || a_alive $n; then print broken
+		else print down; fi
+	else
+		if b_alive $n; then print up; else print down; fi
+	fi
+}
+
+tunnel_up() {
+	local n=$1 dest
+	local -a envs ident
+	[[ -f $SSH_CFG ]] || die "the sandbox is not set up yet; run: aisandbox up"
+	# The control sockets are unix sockets, whose paths macOS limits to 104
+	# bytes, and ssh appends up to 17 of its own while it sets one up.
+	(( ${#RUN} + ${#n} + 20 <= 103 )) || die "the state directory's path is too long for ssh's control sockets ($RUN); set AISANDBOX_HOME to a shorter one"
+	if [[ $T_KIND[$n] == ssh ]]; then
+		# Connection A: your own login to the target. It re-opens the target's
+		# ssh port as a private socket file on the Mac. The stored identity
+		# file and environment reproduce how you connect by hand, e.g.
+		#   AWS_PROFILE=x ssh -i key user@i-0abc
+		if ! a_alive $n; then
+			envs=(${(s:,:)T_ENV[$n]})
+			[[ -n $T_IDENT[$n] ]] && ident=(-i $T_IDENT[$n])
+			(
+				(( $#envs )) && export $envs
+				bg_ssh $RUN/$n.a.log -M -S $RUN/$n.a -fN $ssh_keepalive \
+					-o ControlPersist=no -o RequestTTY=no -o RemoteCommand=none \
+					-o StreamLocalBindUnlink=yes -o StreamLocalBindMask=0177 \
+					$ident -L $RUN/$n.sock:localhost:$T_RPORT[$n] -- $T_TARGET[$n]
+			) || { print -r -- "  ${R}failed${N}  $n: could not connect to $T_TARGET[$n]"; ssh_why $RUN/$n.a.log; return 1 }
+		fi
+		dest=$RUN/$n.sock
+	else
+		dest=$T_TARGET[$n]
+	fi
+	# Connection B: delivers that socket (or host:port) into the VM as a port
+	# on the VM's own loopback.
+	if ! b_alive $n; then
+		bg_ssh $RUN/$n.b.log -F $SSH_CFG -M -S $RUN/$n.b -fN $ssh_keepalive -o ControlPersist=no \
+			-R 127.0.0.1:$T_PORT[$n]:$dest $VM_HOST \
+			|| { print -r -- "  ${R}failed${N}  $n: could not open port $T_PORT[$n] in the VM"; ssh_why $RUN/$n.b.log; return 1 }
+	fi
+	if tunnel_probe $n; then
+		print -r -- "  ${G}up${N}      $n: 'ssh $n' in the VM reaches $T_TARGET[$n]"
+	else
+		print -r -- "  ${Y}up?${N}     $n: tunnel is open but no SSH server answered at the far end"
+	fi
+}
+
+tunnel_down() {
+	local n=$1
+	ssh -F $SSH_CFG -S $RUN/$n.b -O exit $VM_HOST >/dev/null 2>&1
+	if [[ $T_KIND[$n] == ssh ]]; then
+		ssh -S $RUN/$n.a -O exit -- $T_TARGET[$n] >/dev/null 2>&1
+	fi
+	rm -f $RUN/$n.sock $RUN/$n.a.log $RUN/$n.b.log
+	return 0
+}
+
+next_port() {
+	local p used
+	used=" ${(v)T_PORT} "
+	vm_running && used+=" $(vm ss -Hltn 2>/dev/null | awk '{ sub(/.*:/, "", $4); print $4 }' | tr '\n' ' ') "
+	for (( p = PORT_BASE; p < PORT_BASE + 200; p++ )); do
+		[[ $used == *" $p "* ]] && continue
+		nc -z -G 1 127.0.0.1 $p >/dev/null 2>&1 && continue    # busy on the Mac (VM ports are mirrored there)
+		print $p
+		return 0
+	done
+	die "no free tunnel port found"
+}
+
+show_key() {
+	need_running
+	local pub
+	pub=$(vm sh -c 'cat ~/.ssh/id_ed25519.pub' 2>/dev/null)
+	[[ -n $pub ]] || die "the VM has no agent key yet; run: aisandbox up"
+	print -r -- "$pub"
+}
+
+tunnel_add() {
+	local name= target= user= port= rport=22 direct= auto=1 ident= tnote=
+	local -a envs
+	while (( $# )); do
+		case $1 in
+			--note)        tnote=${2:?--note needs some text}; check_note "$tnote"; shift 2 ;;
+			--user)        user=${2:?--user needs a value}; shift 2 ;;
+			--port)        port=${2:?--port needs a value}; shift 2 ;;
+			--remote-port) rport=${2:?--remote-port needs a value}; shift 2 ;;
+			--direct)      direct=${2:?--direct needs host:port}; shift 2 ;;
+			-i|--identity) ident=${2:?$1 needs a key file}; shift 2 ;;
+			--env)         envs+=(${2:?--env needs NAME=VALUE}); shift 2 ;;
+			--no-auto)     auto=0; shift ;;
+			-*)            die "unknown option: $1" ;;
+			*)  if [[ -z $name ]]; then name=$1
+			    elif [[ -z $target ]]; then target=$1
+			    else die "unexpected argument: $1"; fi
+			    shift ;;
+		esac
+	done
+	[[ -n $name ]] || die "usage: aisandbox tunnel add <name> <ssh-target> [--note TEXT] [-i KEYFILE] [--env NAME=VALUE]... [--user U] [--port N] [--remote-port 22] [--no-auto]
+       aisandbox tunnel add <name> --direct host:port [--note TEXT] [--user U] [--port N] [--no-auto]"
+	if [[ -n $ident ]]; then
+		[[ $ident == '~/'* ]] && ident=$HOME/${ident#'~/'}
+		[[ -r $ident ]] || die "identity file not found or not readable: $ident"
+		ident=${ident:A}
+		[[ $ident != *'|'* ]] || die "identity path must not contain '|'"
+	fi
+	local e
+	for e in $envs; do
+		[[ $e =~ '^[A-Za-z_][A-Za-z0-9_]*=[^|,[:space:]]*$' ]] \
+			|| die "--env needs NAME=VALUE, and the value cannot contain spaces, ',' or '|': $e"
+	done
+	[[ -z $direct || ( -z $ident && $#envs -eq 0 ) ]] || die "--identity and --env apply to an ssh target, not to --direct"
+	[[ $name =~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$' ]] || die "tunnel name must be 1-24 characters of A-Z a-z 0-9 . _ -"
+	load_tunnels
+	(( ${T_NAMES[(Ie)$name]} )) && die "a tunnel named '$name' already exists"
+
+	local kind=ssh
+	if [[ -n $direct ]]; then
+		[[ -z $target ]] || die "give either an ssh target or --direct, not both"
+		[[ $direct =~ '^[^:|[:space:]]+:[0-9]+$' ]] || die "--direct needs host:port"
+		kind=direct target=$direct rport=${direct##*:}
+		[[ -n $user ]] || user=$(agent_user)
+	else
+		[[ -n $target ]] || die "missing ssh target (or use --direct host:port)"
+		[[ $target != *'|'* && $target != *[[:space:]]* ]] || die "invalid ssh target"
+		# Ask ssh which user this login resolves to, under the same key and
+		# environment the tunnel will use: an ssh config can choose the user
+		# with a `Match exec` that depends on them. ($(...) is a subshell, so
+		# the exports stay in there.)
+		[[ -n $user ]] || user=$(
+			(( $#envs )) && export $envs
+			ssh -G ${ident:+-i} ${ident:+$ident} -- $target 2>/dev/null | awk '$1 == "user" { print $2; exit }'
+		)
+		[[ -n $user ]] || user=$USER
+	fi
+	[[ $rport =~ '^[0-9]+$' ]] || die "--remote-port must be a number"
+	[[ $user =~ '^[A-Za-z0-9._-]+$' ]] || die "invalid user name: $user"
+	if [[ -n $port ]]; then
+		[[ $port =~ '^[0-9]+$' ]] && (( port >= 1024 && port <= 65535 )) || die "--port must be between 1024 and 65535"
+		[[ " ${(v)T_PORT} " != *" $port "* ]] || die "port $port is already used by another tunnel"
+		(( port != SSHD_PORT )) || die "port $SSHD_PORT is reserved for the tunnel sshd"
+	else
+		port=$(next_port) || exit 1
+	fi
+
+	T_NAMES+=($name)
+	T_KIND[$name]=$kind T_TARGET[$name]=$target T_PORT[$name]=$port
+	T_USER[$name]=$user T_RPORT[$name]=$rport T_AUTO[$name]=$auto
+	T_IDENT[$name]=$ident T_ENV[$name]=${(j:,:)envs} T_NOTE[$name]=$tnote
+	save_tunnels
+	info "Added tunnel '$name': VM port $port -> $target (login as $user)"
+	[[ -n $tnote ]] || note "Tip: describe it for the agents with: aisandbox tunnel note $name \"what this machine is\""
+
+	if vm_running && [[ -f $SSH_CFG ]]; then
+		if ! sync_vm_tunnels; then
+			err "'$name' is registered on the Mac, but the VM could not be updated, so agents cannot use it yet. Retry with: aisandbox up"
+			return 1
+		fi
+		note "Public key to add to ~$user/.ssh/authorized_keys on the target:"
+		note ""
+		note "$(show_key)"
+		note ""
+		tunnel_up $name
+	else
+		note "It will be opened by the next: aisandbox up"
+	fi
+}
+
+tunnel_ls() {
+	load_tunnels
+	if (( ! $#T_NAMES )); then
+		note "no tunnels yet. Add one with: aisandbox tunnel add <name> <ssh-target>"
+		return 0
+	fi
+	local n state color extra
+	# Column widths follow the longest name and target.
+	local -i wn=4 wt=6
+	for n in $T_NAMES; do
+		(( ${#n} > wn )) && wn=${#n}
+		(( ${#T_TARGET[$n]} > wt )) && wt=${#T_TARGET[$n]}
+	done
+	printf "  ${B}%-${wn}s  %-5s %-${wt}s  %-12s %-5s %s${N}\n" NAME PORT TARGET USER AUTO STATE
+	for n in $T_NAMES; do
+		state=$(tunnel_state $n)
+		case $state in up) color=$G ;; broken) color=$R ;; *) color=$D ;; esac
+		printf "  %-${wn}s  %-5s %-${wt}s  %-12s %-5s ${color}%s${N}\n" \
+			$n $T_PORT[$n] "$T_TARGET[$n]" $T_USER[$n] ${${T_AUTO[$n]/1/yes}/0/no} $state
+		# What the agents are told about it.
+		[[ -n ${T_NOTE[$n]:-} ]] && printf "  %-${wn}s  ${D}%s${N}\n" "" "note: $T_NOTE[$n]"
+		# How the Mac logs in, when it is more than plain `ssh <target>`.
+		extra=
+		[[ -n ${T_IDENT[$n]:-} ]] && extra+="key ${T_IDENT[$n]/#$HOME/~}   "
+		[[ -n ${T_ENV[$n]:-} ]] && extra+="env ${T_ENV[$n]//,/ }"
+		[[ -n $extra ]] && printf "  %-${wn}s  ${D}%s${N}\n" "" "Mac login: $extra"
+	done
+	return 0
+}
+
+cmd_tunnel() {
+	local sub=${1:-ls}
+	(( $# )) && shift
+	need_state
+	case $sub in
+		add) require_orb; tunnel_add "$@" ;;
+		ls|list) tunnel_ls ;;
+		up)
+			require_orb; need_running; load_tunnels
+			local n rc=0
+			if (( $# )); then
+				for n in "$@"; do need_tunnel $n; tunnel_up $n || rc=1; done
+			else
+				(( $#T_NAMES )) || note "no tunnels registered"
+				for n in $T_NAMES; do tunnel_up $n || rc=1; done
+			fi
+			return $rc ;;
+		down)
+			load_tunnels
+			local n
+			if (( $# )); then
+				for n in "$@"; do need_tunnel $n; tunnel_down $n; note "closed $n"; done
+			else
+				for n in $T_NAMES; do tunnel_down $n; done
+				note "all tunnels closed"
+			fi ;;
+		rm|remove)
+			(( $# == 1 )) || die "usage: aisandbox tunnel rm <name>"
+			load_tunnels; need_tunnel $1
+			tunnel_down $1
+			T_NAMES=(${T_NAMES:#$1})
+			save_tunnels
+			if vm_running; then
+				if ! sync_vm_tunnels; then
+					err "'$1' is closed and removed on the Mac, but the VM could not be updated and still lists it (as closed). Retry with: aisandbox up"
+					return 1
+				fi
+				# Forget the target's host key, so the name can be reused later.
+				vm ssh-keygen -R aisandbox-$1 >/dev/null 2>&1
+			fi
+			note "removed tunnel $1 (the key on the target is untouched; remove it there if you want)" ;;
+		note)
+			(( $# >= 1 )) || die "usage: aisandbox tunnel note <name> [text]   (no text clears the note)"
+			require_orb; load_tunnels; need_tunnel $1
+			local tname=$1 text
+			shift
+			text="$*"
+			check_note "$text"
+			T_NOTE[$tname]=$text
+			save_tunnels
+			# Saved on the Mac is not the same as visible to the agents: say
+			# which of the two happened.
+			if ! vm_running; then
+				note "saved on the Mac; the VM gets it at the next: aisandbox up"
+			elif ! sync_vm_tunnels; then
+				err "the note is saved on the Mac, but could not be written to the VM: agents do NOT see it yet. Retry with: aisandbox up"
+				return 1
+			elif [[ -n $text ]]; then
+				note "note set for $tname; agents see it in new sessions and in 'sandbox-tunnels'"
+			else
+				note "note cleared for $tname"
+			fi ;;
+		*) die "unknown tunnel command: $sub (add, ls, up, down, rm, note)" ;;
+	esac
+}
+
+# --- top-level commands ---------------------------------------------------------------
+
+# Brings the sandbox into its hardened state, or stops it. Exit status is
+# non-zero if the VM could not be hardened or an autostart tunnel did not open.
+cmd_up() {
+	require_orb
+	local n flag rc=0 started=0 tfail=0
+	# From here on the VM may already be running in an unknown state, so every
+	# failure goes through fail_closed rather than a plain exit.
+	ensure_state || fail_closed "the sandbox state directory is unusable"
+
+	# Host side first. The OrbStack isolation settings are what keeps the
+	# Mac's files and ssh agent out of the VM, and they only take effect when
+	# the VM starts, so a running VM is restarted if any had to be corrected.
+	NEED_RESTART=0
+	orb_settings fix || fail_closed "the OrbStack isolation settings are wrong and could not be corrected"
+	if (( NEED_RESTART )) && [[ $(vm_state) != stopped ]]; then
+		info "Restarting $MACHINE to apply the corrected isolation settings"
+		close_all_tunnels
+		stop_vm || fail_closed "could not stop $MACHINE to apply the isolation settings"
+	fi
+
+	ensure_running || fail_closed "$MACHINE did not come up in a usable state"
+	info "Applying sandbox configuration in the VM"
+	provision || fail_closed "the sandbox could not be hardened"
+
+	# Two things can call for one restart of the VM at this point.
+	# It had been running without its hardening: nothing started in that state
+	# (a root shell, a connection to the LAN) should survive. provision.sh
+	# leaves a flag for that in /run, which a reboot empties.
+	local why_restart=
+	flag=$(vmroot sh -c "[ -e $REBOOT_FLAG ] && echo yes || echo no" 2>/dev/null)
+	case ${flag%$'\r'} in
+		no) ;;
+		yes) why_restart="so that nothing from before this setup is left running or mounted" ;;
+		*) fail_closed "could not query $MACHINE after provisioning" ;;
+	esac
+	# Or a shared folder is still at /mnt/mac/... and can move to its Mac
+	# path, which OrbStack does when the VM starts.
+	SHARES_MOVED=0
+	move_shares_to_mac_paths || rc=1
+	(( SHARES_MOVED )) && why_restart="${why_restart:+$why_restart, and }to mount the shared folders at their Mac paths"
+	if [[ -n $why_restart ]]; then
+		info "Restarting $MACHINE once, $why_restart"
+		close_all_tunnels
+		stop_vm || fail_closed "could not restart $MACHINE"
+		ensure_running || fail_closed "$MACHINE did not come back up in a usable state"
+		provision || fail_closed "the sandbox could not be hardened after the restart"
+		flag=$(vmroot sh -c "[ -e $REBOOT_FLAG ] && echo yes || echo no" 2>/dev/null)
+		[[ ${flag%$'\r'} == no ]] || fail_closed "the hardening does not survive a restart of $MACHINE"
+	fi
+
+	# The VM is hardened from here on. What follows can fail without that
+	# changing, so it is reported and reflected in the exit status, but it
+	# does not stop the VM.
+	# Every shared folder has to be mounted where it should be. That takes an
+	# answer from the VM that is successful and covers every share: no answer,
+	# or fewer lines than shares, is a failure too, not "nothing to report".
+	local sline ssrc sat
+	shares_check
+	case $? in
+		1) warn "could not ask the VM whether the shared folders are mounted"; rc=1 ;;
+		2) warn "the VM answered for $#SHARE_LINES of $SHARES_WANT shared folders; the others are not known to be mounted"; rc=1 ;;
+		3) warn "could not read OrbStack's configuration, so it is not known which folders are shared"; rc=1 ;;
+	esac
+	for sline in $SHARE_LINES; do
+		[[ $sline == failed$'\t'* ]] || continue
+		ssrc=${${sline#*$'\t'}%%$'\t'*} sat=${sline##*$'\t'}
+		warn "$ssrc is not mounted at $sat in the VM (a newly shared folder appears after a VM restart: aisandbox down && aisandbox up)"
+		rc=1
+	done
+
+	load_tunnels
+	if ! sync_vm_tunnels; then
+		warn "the tunnel list and agent instructions in the VM could not be updated; agents may see outdated information"
+		rc=1
+	fi
+	for n in $T_NAMES; do
+		[[ $T_AUTO[$n] == 1 ]] || continue
+		(( started++ )) || info "Opening tunnels"
+		tunnel_up $n || { rc=1; tfail=1 }
+	done
+	cmd_status
+	(( tfail )) && warn "the sandbox is up and hardened, but not every tunnel could be opened"
+	return $rc
+}
+
+cmd_down() {
+	require_orb
+	need_state
+	local rc=0
+	close_all_tunnels
+	if [[ $(vm_state) != stopped ]]; then
+		info "Stopping $MACHINE"
+		if ! stop_vm; then
+			warn "$MACHINE keeps being started again by another program connecting to it (it is still hardened: the firewall loads at boot)"
+			rc=1
+		fi
+	fi
+	note "all tunnels are closed, $MACHINE is $(vm_state)"
+	return $rc
+}
+
+cmd_status() {
+	require_orb
+	need_state
+	print
+	if ! vm_running; then
+		print -r -- "${B}$MACHINE${N}  ${D}stopped${N}   (start with: aisandbox up)"
+		return 0
+	fi
+	print -r -- "${B}$MACHINE${N}  ${G}running${N}"
+	printf "  %-11s isolated=%s  isolate_network=%s  ssh_agent=%s  lan_ports=%s\n" isolation \
+		"$(cfg_get machine.$MACHINE.isolated)" "$(cfg_get machine.$MACHINE.isolate_network)" \
+		"$(cfg_get machine.$MACHINE.forward_ssh_agent)" "$(cfg_get machines.expose_ports_to_lan)"
+	# One shared folder per line, home shortened to ~. Where it is in the VM
+	# is only said when that is not its Mac path.
+	local m msrc mat label=mounts
+	local -a mounts
+	if m=$(share_list); then
+		mounts=(${(f)m})
+		(( $#mounts )) || printf "  %-11s ${D}%s${N}\n" mounts "none (share a folder with: aisandbox mount add <folder>)"
+	else
+		printf "  %-11s ${R}%s${N}\n" mounts "unknown: OrbStack's configuration could not be read"
+	fi
+	for m in $mounts; do
+		msrc=${m%%$'\t'*} mat=${m#*$'\t'}
+		if [[ $mat == $msrc ]]; then m=${msrc/#$HOME/\~}; else m="${msrc/#$HOME/~}  ${D}(in the VM: $mat)${N}"; fi
+		printf "  %-11s %s\n" "$label" "$m"
+		label=
+	done
+
+	local user=$(agent_user) facts fw sudo sshd insync
+	facts=$(vmroot sh -c '
+		nft list table inet aisandbox >/dev/null 2>&1 && echo fw=1 || echo fw=0
+		runuser -u "$1" -- sudo -n true >/dev/null 2>&1 && echo sudo=1 || echo sudo=0
+		echo sshd=$(ss -Hltnp 2>/dev/null | awk "/\"sshd\"/ { print \$4 }" | sort -u | tr "\n" " ")
+	' sh $user 2>/dev/null)
+	[[ $facts == *fw=1* ]] && fw="${G}loaded${N}" || fw="${R}NOT LOADED${N}"
+	[[ $facts == *sudo=0* ]] && sudo="${G}removed${N}" || sudo="${R}STILL PRESENT${N}"
+	sshd=${${(M)${(f)facts}:#sshd=*}#sshd=}
+	if vmroot cat /etc/nftables.conf 2>/dev/null | cmp -s - $SRC/vm/nftables.conf; then insync=; else insync=" ${Y}(differs from vm/nftables.conf; run: aisandbox up)${N}"; fi
+	printf "  %-11s firewall %s%s, agent sudo %s, tunnel sshd on %s\n" hardening "$fw" "$insync" "$sudo" "${sshd:-${R}not running${N}}"
+	print -r -- "  tunnels"
+	tunnel_ls | sed 's/^/  /'
+	print
+}
+
+# Checks the sandbox from the agent's point of view.
+cmd_doctor() {
+	require_orb
+	need_state
+	need_running
+	FAILS=0
+	info "OrbStack settings"
+	orb_settings report
+
+	# How programs on the Mac (Claude desktop, as a remote environment) log in
+	# to the VM: OrbStack's own SSH, as `ssh <machine>@orb`. This is checked
+	# separately because it is not what the rest of this script uses (`orb`).
+	# The VM's .orb.local name is NOT a dependable way in: OrbStack stopped
+	# publishing it for this machine once, and a restart of OrbStack did not
+	# bring it back.
+	if ssh -o BatchMode=yes -o ConnectTimeout=6 $MACHINE@orb true >/dev/null 2>&1; then
+		pass "ssh $MACHINE@orb works (use this as the SSH host in Claude desktop)"
+	else
+		fail "ssh $MACHINE@orb does not work; it needs 'Include ~/.orbstack/ssh/config' in ~/.ssh/config, which OrbStack adds"
+	fi
+
+	info "Hardening (checked as root)"
+	local user=$(agent_user)
+	if vmroot nft list table inet aisandbox >/dev/null 2>&1; then pass "firewall table is loaded"; else fail "firewall table is not loaded"; fi
+	if vmroot cat /etc/nftables.conf 2>/dev/null | cmp -s - $SRC/vm/nftables.conf; then
+		pass "firewall rules match vm/nftables.conf"
+	else
+		fail "firewall rules in the VM differ from vm/nftables.conf (run: aisandbox up)"
+	fi
+	if vmroot systemctl is-enabled nftables.service >/dev/null 2>&1; then pass "firewall is enabled at boot"; else fail "nftables.service is not enabled"; fi
+
+	# Shared folders: each has to be OrbStack's mount of that very Mac folder,
+	# and at its Mac path for git worktrees to work across the Mac and the VM.
+	local sline st ssrc sat
+	shares_check
+	case $? in
+		1) fail "could not ask the VM whether the shared folders are mounted" ;;
+		2) fail "the VM answered for $#SHARE_LINES of $SHARES_WANT shared folders (run: aisandbox up)" ;;
+		3) fail "could not read OrbStack's configuration, so it is not known which folders are shared" ;;
+	esac
+	for sline in $SHARE_LINES; do
+		st=${sline%%$'\t'*} ssrc=${${sline#*$'\t'}%%$'\t'*} sat=${sline##*$'\t'}
+		if [[ $st != ok ]]; then fail "$ssrc is not mounted at $sat in the VM (run: aisandbox up; a newly shared folder needs a VM restart)"
+		elif [[ $sat == $ssrc ]]; then pass "$ssrc is mounted at its Mac path in the VM"
+		else skip "$ssrc is shared at $sat, not at its Mac path; git worktrees will not carry over for it ('aisandbox up' says why)"; fi
+	done
+
+	# A real listener on the Mac, on every interface, so "blocked" means blocked
+	# and not merely "nothing was listening".
+	local port=$(( 20000 + RANDOM % 20000 )) lfd= accpid= ip gw
+	local -a macips reach
+	zmodload zsh/net/tcp 2>/dev/null
+	if ztcp -l $port 2>/dev/null; then
+		lfd=$REPLY
+		( while ztcp -a $lfd 2>/dev/null; do ztcp -c $REPLY; done ) &
+		accpid=$!
+		sleep 0.2
+	fi
+	macips=($(ifconfig 2>/dev/null | awk '$1 == "inet" && $2 !~ /^127\./ { print $2 }'))
+	for ip in $macips; do
+		nc -z -G 2 $ip $port >/dev/null 2>&1 && reach+=($ip)
+	done
+	gw=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2 }')
+
+	info "Network, as the agent user sees it"
+	# The results are collected first and printed after `orb` has exited: while
+	# it runs, orb keeps the terminal in raw mode, and anything printed then
+	# comes out as a staircase.
+	local out line verdict text
+	out=$(vm_in bash -s -- $port "$gw" $SSHD_PORT $reach 2>/dev/null <<'EOS'
+port=$1; gw=$2; sshd_port=$3; shift 3
+open() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+blocked() { if open "$2" "$3"; then echo "fail|$1 is REACHABLE at $2:$3"; else echo "pass|$1 is blocked ($2:$3)"; fi; }
+allowed() { if open "$2" "$3"; then echo "pass|$1 is reachable ($2:$3)"; else echo "fail|$1 is NOT reachable ($2:$3)"; fi; }
+
+if sudo -n true 2>/dev/null; then echo "fail|agent user can sudo without a password"; else echo "pass|agent user cannot sudo"; fi
+
+for ip in "$@"; do blocked "Mac address" "$ip" "$port"; done
+[ $# -gt 0 ] || echo "skip|no Mac LAN address had a reachable test listener"
+for name in host.orb.internal host.internal host.docker.internal; do
+	ip=$(getent hosts "$name" | awk '{ print $1; exit }')
+	[ -n "$ip" ] && blocked "Mac via $name" "$ip" "$port"
+done
+if [ -n "$gw" ]; then
+	for p in 53 80 443; do blocked "LAN router" "$gw" "$p"; done
+fi
+
+allowed "public internet" 1.1.1.1 443
+if getent hosts example.com >/dev/null; then echo "pass|DNS resolves public names"; else echo "fail|DNS does not resolve"; fi
+if curl -fsS -m 10 -o /dev/null https://example.com 2>/dev/null; then echo "pass|HTTPS to the internet works"; else echo "fail|HTTPS to the internet does not work"; fi
+
+if ss -Hltn | awk '{ print $4 }' | grep -qx "127.0.0.1:$sshd_port"; then echo "pass|tunnel sshd listens on 127.0.0.1:$sshd_port"; else echo "fail|tunnel sshd is not listening on 127.0.0.1:$sshd_port"; fi
+if [ -s /etc/claude-code/CLAUDE.md ] && command -v sandbox-tunnels >/dev/null; then echo "pass|agents are told about the sandbox and its tunnels (/etc/claude-code/CLAUDE.md, sandbox-tunnels)"
+else echo "fail|the agent instructions or the sandbox-tunnels command are missing (run: aisandbox up)"; fi
+# A login shell is what OrbStack's SSH, and so Claude desktop, gives an agent.
+if ! command -v git >/dev/null; then echo "fail|git is not installed in the VM (run: aisandbox up)"
+elif [ "$(bash -lc 'git config --get commit.gpgsign' 2>/dev/null)" = false ]; then echo "pass|git commits in the VM are unsigned by default (the signing key stays on the Mac)"
+else echo "fail|git in the VM would try to sign commits and fail (run: aisandbox up)"; fi
+# Worktrees on the Mac outside the shared folders look missing from here;
+# neither an automatic gc nor an explicit prune may delete their metadata.
+if [ "$(bash -lc 'git config --get gc.worktreePruneExpire' 2>/dev/null)" = never ] && [ "$(git config --system --get gc.worktreePruneExpire 2>/dev/null)" = never ]; then echo "pass|git gc in the VM never prunes worktree metadata"
+else echo "fail|git gc in the VM could prune Mac worktree metadata (run: aisandbox up)"; fi
+if bash -lc 'cd / && git worktree prune' 2>&1 | grep -q "disabled in this sandbox"; then echo "pass|git worktree prune is refused in the VM"
+else echo "fail|git worktree prune is not blocked in the VM (run: aisandbox up)"; fi
+wild=$(ss -Hltn | awk '$4 ~ /^(0\.0\.0\.0|\*|\[::\]):/ { print $4 }' | tr '\n' ' ')
+if [ -n "$wild" ]; then echo "skip|services in the VM listening on all interfaces: $wild"; fi
+EOS
+	)
+	[[ -n $out ]] || fail "could not run the checks inside the VM"
+	for line in ${(f)out}; do
+		line=${line%$'\r'}
+		verdict=${line%%|*} text=${line#*|}
+		case $verdict in
+			pass) pass $text ;;
+			fail) fail $text ;;
+			*)    skip $text ;;
+		esac
+	done
+	if [[ -n $accpid ]]; then
+		kill $accpid 2>/dev/null
+		wait $accpid 2>/dev/null
+		ztcp -c $lfd 2>/dev/null
+	fi
+
+	# The other direction: a service in the VM listening on all interfaces
+	# must show up on the Mac's loopback only, not on its LAN address.
+	local lport=$(( port + 1 )) bound
+	orb -m $MACHINE timeout 5 nc -l 0.0.0.0 $lport </dev/null >/dev/null 2>&1 &
+	sleep 2
+	bound=$(lsof -nP -iTCP:$lport -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }' | sort -u | tr '\n' ' ')
+	wait $! 2>/dev/null
+	if [[ -z $bound ]]; then skip "could not observe how VM services are published on the Mac"
+	elif [[ -z ${${(s: :)bound}:#(127.0.0.1|\[::1\]):*} ]]; then pass "VM services are published on the Mac's loopback only ($bound)"
+	else fail "VM services are published beyond loopback: $bound(restart the VM: aisandbox down; aisandbox up)"; fi
+
+	load_tunnels
+	if (( $#T_NAMES )); then
+		info "Tunnels"
+		local n state err
+		for n in $T_NAMES; do
+			state=$(tunnel_state $n)
+			if [[ $state == down ]]; then skip "$n is down (aisandbox tunnel up $n)"; continue; fi
+			if [[ $state == broken ]]; then fail "$n is half open (aisandbox tunnel down $n; aisandbox tunnel up $n)"; continue; fi
+			if ! tunnel_probe $n; then fail "$n is up but no SSH server answers through it"; continue; fi
+			err=$(vm ssh -o BatchMode=yes -o ConnectTimeout=8 $n true 2>&1)
+			if (( $? == 0 )); then pass "$n: the agent can log in to $T_TARGET[$n] as $T_USER[$n]"
+			elif [[ $err == *"Permission denied"* ]]; then skip "$n: path works, but the target does not accept the VM key yet (aisandbox key)"
+			else fail "$n: ${err##*$'\n'}"; fi
+		done
+	fi
+
+	print
+	if (( FAILS )); then
+		print -r -- "${R}$FAILS check(s) failed.${N}"
+		return 1
+	fi
+	print -r -- "${G}All checks passed.${N}"
+}
+
+cmd_mount() {
+	require_orb
+	local sub=${1:-ls} key=machine.$MACHINE.mounts m src at entry answer st cfg
+	local -a entries
+	local unreadable="OrbStack's configuration could not be read"
+	(( $# )) && shift
+	case $sub in
+		ls|list)
+			cfg=$(share_list) || die "$unreadable, so it is not known which folders are shared"
+			entries=(${(f)cfg})
+			(( $#entries )) || { note "no folders are shared with $MACHINE"; return 0 }
+			if ! vm_running; then
+				for entry in $entries; do
+					src=${entry%%$'\t'*} at=${entry#*$'\t'}
+					if [[ $at == $src ]]; then note $src; else note "$src  (in the VM: $at)"; fi
+				done
+				return 0
+			fi
+			# With the VM running, say whether each one is really mounted.
+			shares_check
+			case $? in
+				1) warn "could not ask the VM whether the shared folders are mounted"; for entry in $entries; do note ${entry%%$'\t'*}; done; return 1 ;;
+				2) warn "the VM answered for $#SHARE_LINES of $SHARES_WANT shared folders" ;;
+				3) die "$unreadable, so it is not known which folders are shared" ;;
+			esac
+			for entry in $SHARE_LINES; do
+				st=${entry%%$'\t'*} src=${${entry#*$'\t'}%%$'\t'*} at=${entry##*$'\t'}
+				[[ $at == $src ]] && at= || at="  (in the VM: $at)"
+				if [[ $st == ok ]]; then note "$src$at"; else note "$src$at  ${R}NOT MOUNTED${N} (a newly shared folder appears after a VM restart)"; fi
+			done
+			return 0 ;;
+		add)
+			(( $# == 1 )) || die "usage: aisandbox mount add <folder>"
+			[[ -d $1 ]] || die "not a folder: $1"
+			src=${1:A}
+			[[ $src != *[,:]* ]] || die "a shared folder's path cannot contain ',' or ':'"
+			cfg=$(share_entries) || die "$unreadable; nothing was changed"
+			for m in ${(f)cfg}; do [[ ${m%%:*} == $src ]] && die "$src is already shared"; done
+			# At its Mac path in the VM if that is safe (the VM has to be
+			# running for the check); otherwise at /mnt/mac/..., and the
+			# next `up` moves it once it can check.
+			entry=$src
+			if vm_running; then
+				answer=$(share_check $src)
+				if [[ $answer == safe$'\t'* ]]; then entry=$src:$src
+				elif [[ $answer == unsafe$'\t'* ]]; then note "it will be at /mnt/mac$src in the VM, not at its Mac path: ${answer##*$'\t'}"
+				fi
+			fi
+			orb config add $key $entry >/dev/null 2>&1
+			cfg=$(share_entries) || die "$unreadable, so it is not known whether $src was added"
+			has_entry "$cfg" $entry || die "could not add the shared folder"
+			note "added $src" ;;
+		rm|remove)
+			(( $# == 1 )) || die "usage: aisandbox mount rm <folder>"
+			src=$1
+			[[ -d $src ]] && src=${src:A}
+			# Every entry for this folder: it can be registered more than once
+			# (at /mnt/mac and at its Mac path, after a move that half failed).
+			cfg=$(share_entries) || die "$unreadable; nothing was changed"
+			for m in ${(f)cfg}; do [[ ${m%%:*} == $src ]] && entries+=($m); done
+			(( $#entries )) || die "$src is not shared (see: aisandbox mount ls)"
+			for entry in $entries; do orb config remove $key $entry >/dev/null 2>&1; done
+			# Believe the configuration, not the exit status: "removed" must
+			# mean that no entry gives the VM this folder any more. And the
+			# configuration has to be READ for that: one that cannot be read
+			# is empty, and empty would look exactly like "removed".
+			cfg=$(share_entries) || die "could not confirm the removal: $unreadable. $src may still be available to the VM"
+			for m in ${(f)cfg}; do
+				[[ ${m%%:*} == $src ]] && die "could not remove the shared folder: $src is still registered ($m) and will stay available to the VM"
+			done
+			note "removed $src" ;;
+		*) die "unknown mount command: $sub (ls, add, rm)" ;;
+	esac
+	if vm_running; then
+		note "Changes to the shared folders apply after a VM restart, which ends running agent sessions."
+		if confirm "    Restart $MACHINE now?"; then
+			# `up` leaves a running, hardened VM alone, so without a real stop
+			# the change would silently not apply (a removed folder would
+			# stay shared) while everything reports success.
+			cmd_down || die "$MACHINE did not stop, so the change is NOT in effect: it still has its previous shared folders. Close whatever keeps connecting to it, then run: aisandbox down && aisandbox up"
+			cmd_up
+		else
+			note "Until then $MACHINE keeps its previous shared folders. Restart with: aisandbox down && aisandbox up"
+		fi
+	fi
+}
+
+cmd_key() { require_orb; show_key }
+
+cmd_shell() { require_orb; need_running; exec orb -m $MACHINE "$@" }
+
+cmd_root() {
+	require_orb; need_running
+	[[ ${1:-} == -- ]] && shift
+	exec orb -m $MACHINE -u root "$@"
+}
+
+usage() {
+	cat <<EOF
+aisandbox — start, harden and tunnel the $MACHINE OrbStack VM
+
+  aisandbox                 interactive menu
+  aisandbox up              start the VM, enforce isolation and hardening, open
+                            tunnels; stops the VM if it cannot be hardened
+  aisandbox down            close tunnels and stop the VM
+  aisandbox status          VM, isolation, hardening and tunnel state
+  aisandbox doctor          verify the isolation from inside the VM
+
+  aisandbox tunnel add <name> <ssh-target> [--note TEXT] [-i KEYFILE] [--env NAME=VALUE]...
+                            [--user U] [--port N] [--remote-port 22] [--no-auto]
+      --note tells the agents what the machine is, e.g. --note "archive node, read-only"
+      -i and --env are for the Mac's own login, when you normally type e.g.
+        AWS_PROFILE=dev ssh -i ~/.ssh/key ec2-user@i-0abc
+      -> aisandbox tunnel add box ec2-user@i-0abc -i ~/.ssh/key --env AWS_PROFILE=dev
+  aisandbox tunnel add <name> --direct host:port [--user U] [--port N] [--no-auto]
+  aisandbox tunnel ls | up [name...] | down [name...] | rm <name>
+  aisandbox tunnel note <name> [text]    set (or with no text, clear) the note
+  aisandbox key             public key of the VM, to authorize on targets
+
+  aisandbox mount ls | add <folder> | rm <folder>
+                            a shared folder is at the same path in the VM as on the Mac
+  aisandbox shell           shell in the VM as the agent user
+  aisandbox root [-- cmd]   run a command (or a shell) as root in the VM,
+                            e.g. aisandbox root -- apt-get install -y jq
+
+Agents in the VM reach a tunnelled machine with: ssh <name>
+They learn what exists from /etc/claude-code/CLAUDE.md (generated, loaded by
+Claude at session start) and from the 'sandbox-tunnels' command in the VM.
+State lives in $STATE
+EOF
+}
+
+# A path typed at a menu prompt: strip quotes and expand a leading ~, but do
+# not glob or evaluate it.
+menu_path() {
+	local p=${(Q)${1:-}}
+	[[ $p == '~' || $p == '~/'* ]] && p=$HOME${p#'~'}
+	print -r -- $p
+}
+
+menu() {
+	local choice a b c
+	local -a extra
+	while true; do
+		cmd_status
+		cat <<EOF
+  ${B}1${N} up            ${B}5${N} add tunnel       ${B}9${N}  shell in VM
+  ${B}2${N} down          ${B}6${N} open tunnels     ${B}10${N} add mount
+  ${B}3${N} doctor        ${B}7${N} close tunnels    ${B}11${N} remove mount
+  ${B}4${N} show VM key   ${B}8${N} remove tunnel    ${B}q${N}  quit
+EOF
+		read -r "choice?> " || return 0
+		print
+		# Each action runs in a subshell so that a failure returns to the menu.
+		case $choice in
+			1) ( cmd_up ) ;;
+			2) ( cmd_down ) ;;
+			3) ( cmd_doctor ) ;;
+			4) ( cmd_key ) ;;
+			5) read -r "a?Name for the tunnel (agents will type 'ssh <name>'): "
+			   read -r "b?SSH target as you would type it on this Mac (e.g. user@host): "
+			   read -r "c?Extra options, or Enter for none (e.g. -i ~/.ssh/key --env AWS_PROFILE=dev): "
+			   # Split the extra options like a shell would and strip the quotes
+			   # (z, then Q), without evaluating anything in them.
+			   extra=()
+			   [[ -n $c ]] && extra=("${(@Q)${(z)c}}")
+			   [[ -n $a && -n $b ]] && ( cmd_tunnel add $a $b "${extra[@]}" ) ;;
+			6) ( cmd_tunnel up ) ;;
+			7) ( cmd_tunnel down ) ;;
+			8) read -r "a?Tunnel to remove: "; [[ -n $a ]] && ( cmd_tunnel rm $a ) ;;
+			9) ( orb -m $MACHINE ) ;;
+			10) read -r "a?Folder on the Mac to share: "; a=$(menu_path $a); [[ -n $a ]] && ( cmd_mount add $a ) ;;
+			11) read -r "a?Shared folder to remove: "; a=$(menu_path $a); [[ -n $a ]] && ( cmd_mount rm $a ) ;;
+			q|Q|'') return 0 ;;
+			*) print "unknown choice: $choice" ;;
+		esac
+		[[ $choice == (2|9) ]] || { print; read -r "a?Press Enter to continue " || return 0; }
+	done
+}
+
+main() {
+	if (( ! $# )); then
+		[[ -t 0 && -t 1 ]] || { usage; return 0 }
+		require_orb
+		menu
+		return
+	fi
+	local cmd=$1
+	shift
+	case $cmd in
+		up|start) cmd_up "$@" ;;
+		down|stop) cmd_down "$@" ;;
+		status)  cmd_status "$@" ;;
+		doctor|check) cmd_doctor "$@" ;;
+		tunnel|tunnels) cmd_tunnel "$@" ;;
+		key)     cmd_key "$@" ;;
+		mount|mounts) cmd_mount "$@" ;;
+		shell)   cmd_shell "$@" ;;
+		root)    cmd_root "$@" ;;
+		help|-h|--help) usage ;;
+		*) usage >&2; die "unknown command: $cmd" ;;
+	esac
+}
+
+main "$@"

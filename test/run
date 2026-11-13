@@ -1,0 +1,26 @@
+#!/bin/bash
+#
+# Runs test suites and summarises them.
+#
+#   test/run                  unit, shares and git: nothing of yours is changed
+#   test/run tunnel cli       named suites
+#   test/run all              everything except `disruptive`
+#
+# See test/README.md for what each suite needs and touches.
+
+cd "$(dirname "$0")" || exit 2
+if [ $# -eq 0 ]; then set -- unit shares git; fi
+if [ "$1" = all ]; then set -- unit shares git tunnel cli; fi
+
+failed=""
+for suite in "$@"; do
+	if [ ! -f "$suite.sh" ]; then echo "no such suite: $suite"; exit 2; fi
+	printf '\n######## %s\n' "$suite"
+	bash "./$suite.sh"
+	rc=$?
+	if [ $rc -ne 0 ]; then failed="$failed $suite(exit $rc)"; fi
+done
+
+printf '\n########\n'
+if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi
+echo "all suites passed: $*"

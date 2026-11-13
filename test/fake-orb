@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# Stands in for `orb` in test/unit.sh: one machine, FakeBox, and no VM behind
+# it. Everything it knows and records is in the directory $FAKE_DIR:
+#
+#   orb.config   what `orb config show` prints; `config add` and `config
+#                remove` really edit the list on the given line
+#   orb.log      every configuration change, and every call it did not expect
+#
+# The machine is stopped unless FAKE_RUNNING is set. Then the few calls the
+# CLI makes to look at and publish to the VM are played:
+#
+#   vm.status    read as the VM's answer about the shared folders; if the file
+#                is missing, the query fails
+#   vm.CLAUDE.md, vm.tunnels, vm.sshconf
+#                what the CLI would have written into the VM
+#
+# Failures can be switched on:
+#   FAKE_ADD_FAILS, FAKE_REMOVE_FAILS   `config add` / `config remove` fail
+#                                       without changing anything
+#   FAKE_SHOW_FAILS                     `config show` fails
+#   FAKE_SHOW_FAILS_AFTER_CHANGE        `config show` fails once a change has
+#                                       been attempted (the file "changed"
+#                                       marks that; tests remove it first)
+# Any other call means the CLI tried to reach a VM, and is logged as
+# UNEXPECTED, which the suite checks for at the end.
+
+: "${FAKE_DIR:?}"
+
+case "$1 $2 $3" in
+	"list -q ")     echo FakeBox; exit 0 ;;
+	"list -r -q")   if [ -n "$FAKE_RUNNING" ]; then echo FakeBox; fi; exit 0 ;;
+	"list  ")       echo "FakeBox  stopped  ubuntu  resolute  arm64  1 GB"; exit 0 ;;
+	"config show ")
+		if [ -n "$FAKE_SHOW_FAILS" ]; then exit 1; fi
+		if [ -n "$FAKE_SHOW_FAILS_AFTER_CHANGE" ] && [ -e "$FAKE_DIR/changed" ]; then exit 1; fi
+		cat "$FAKE_DIR/orb.config"; exit 0 ;;
+esac
+
+case "$1 $2" in
+	"config set")
+		echo "config-change: $*" >> "$FAKE_DIR/orb.log"
+		exit 0 ;;
+	"config add"|"config remove")
+		echo "config-change: $*" >> "$FAKE_DIR/orb.log"
+		: > "$FAKE_DIR/changed"
+		if [ "$2" = remove ] && [ -n "$FAKE_REMOVE_FAILS" ]; then exit 1; fi
+		if [ "$2" = add ] && [ -n "$FAKE_ADD_FAILS" ]; then exit 1; fi
+		awk -F': ' -v key="$3" -v value="$4" -v op="$2" '
+			$1 == key {
+				n = split($2, item, ","); list = ""
+				for (i = 1; i <= n; i++)
+					if (!(op == "remove" && item[i] == value)) list = list (list == "" ? "" : ",") item[i]
+				if (op == "add") list = list (list == "" ? "" : ",") value
+				print key ": " list
+				next
+			}
+			{ print }' "$FAKE_DIR/orb.config" > "$FAKE_DIR/orb.config.new" \
+			&& mv "$FAKE_DIR/orb.config.new" "$FAKE_DIR/orb.config"
+		exit 0 ;;
+esac
+
+if [ -n "$FAKE_RUNNING" ]; then
+	case "$*" in
+		*aisandbox-shares-status*)                       cat "$FAKE_DIR/vm.status" 2>/dev/null || exit 1; exit 0 ;;
+		*"cat > /etc/claude-code/CLAUDE.md"*)            cat > "$FAKE_DIR/vm.CLAUDE.md"; exit 0 ;;
+		*"cat > /etc/aisandbox/tunnels"*)                cat > "$FAKE_DIR/vm.tunnels"; exit 0 ;;
+		*"cat > /etc/ssh/ssh_config.d/aisandbox.conf"*)  cat > "$FAKE_DIR/vm.sshconf"; exit 0 ;;
+		*"ssh-keygen -R"*)                               exit 0 ;;
+	esac
+fi
+
+echo "UNEXPECTED: $*" >> "$FAKE_DIR/orb.log"
+exit 99
